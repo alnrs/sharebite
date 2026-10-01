@@ -1,0 +1,53 @@
+import assert from 'node:assert/strict';
+// Controlled integration contract tests. These never contact the user's AWS account.
+const publicConfig={mode:'live',region:'us-east-1',userPoolId:'us-east-1_SAMPLE',userPoolClientId:'public-sample-client',apiBaseUrl:'https://example.execute-api.us-east-1.amazonaws.com/prod'};
+globalThis.window={SHAREBITE_CONFIG:publicConfig};
+const storage=new Map();
+globalThis.sessionStorage={getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)};
+const urlSafe=x=>Buffer.from(JSON.stringify(x)).toString('base64url');
+const idToken=exp=>`a.${urlSafe({sub:'example-member',name:'Example Member',email:'member@example.test',iss:`https://cognito-idp.us-east-1.amazonaws.com/${publicConfig.userPoolId}`,aud:publicConfig.userPoolClientId,token_use:'id',exp})}.signature`;
+let requests=[];
+globalThis.fetch=async(url, opts={})=>{
+  requests.push({url:String(url),opts});
+  if (String(url)==='https://cognito-idp.us-east-1.amazonaws.com/') {
+    const action=opts.headers['X-Amz-Target'].split('.').pop();
+    const input=JSON.parse(opts.body);
+    assert.equal(input.ClientId,publicConfig.userPoolClientId);
+    if (action==='InitiateAuth') return {ok:true,json:async()=>({AuthenticationResult:{IdToken:idToken(Math.floor(Date.now()/1000)+3600),AccessToken:'ACCESS_SAMPLE',RefreshToken:'REFRESH_SAMPLE'}})};
+    if (['SignUp','ConfirmSignUp','ForgotPassword','ConfirmForgotPassword','ResendConfirmationCode'].includes(action)) return {ok:true,json:async()=>({})};
+    throw Error('Unexpected Cognito action '+action);
+  }
+  if(String(url).endsWith('/uploads/presign'))return {ok:true,json:async()=>({uploadUrl:'https://signed.example/upload',fields:{key:'users/example-member/uploads/image.jpg','Content-Type':'image/jpeg'},imageKey:'users/example-member/uploads/image.jpg'})};
+  if(String(url)==='https://signed.example/upload')return {ok:true,status:204};
+  if(String(url).endsWith('/food')&&opts.method==='POST')return {ok:true,json:async()=>({message:'Created',item:{listingId:'example'}})};
+  if(String(url).endsWith('/food'))return {ok:true,json:async()=>[]};
+  if(String(url).endsWith('/health'))return {ok:true,json:async()=>({status:'ok'})};
+  if(String(url).endsWith('/messages'))return {ok:true,json:async()=>({message:'Message sent',threadId:'t1'})};
+  return {ok:true,json:async()=>[]};
+};
+const api=await import('../js/api.js');
+const auth=await import('../js/auth.js');
+assert.equal(await auth.currentSession(),null);
+await auth.register('Example Member','member@example.test','Example_Password_123!');
+await auth.confirmAccount('member@example.test','123456');
+await auth.resendConfirmation('member@example.test');
+await auth.requestPasswordReset('member@example.test');
+await auth.completePasswordReset('member@example.test','123456','Example_Password_123!');
+await auth.signIn('member@example.test','Example_Password_123!');
+assert.equal((await auth.currentSession()).claims.sub,'example-member');
+assert.deepEqual(await api.getListings(),[]);
+const foodRequest=requests.find(r=>r.url.endsWith('/food')&&r.opts.method==='GET');
+assert.equal(foodRequest.opts.headers.Authorization,'Bearer '+(await auth.currentSession()).jwt);
+const body={foodName:'Safe bread',category:'Bakery',description:'Test',quantity:'2',location:'CV1',expiryTime:new Date().toISOString(),allergyInfo:'Wheat',storageInstructions:'Cool'};
+const jpeg=new Blob([new Uint8Array([0xff,0xd8,0xff])],{type:'image/jpeg'});
+assert.equal((await api.createListing(body,jpeg)).message,'Created');
+const s3=requests.find(r=>r.url==='https://signed.example/upload');
+assert(s3.opts.body instanceof FormData,'S3 POST should be multipart');
+assert.equal(s3.opts.headers,undefined,'Never attach the Cognito authorization header to private S3 upload');
+const message=await api.sendMessage({listingId:'food-1',toUserId:'donor-2',text:'May I collect this?'});
+assert.equal(message.threadId,'t1');
+assert.equal((await api.health()).status,'ok');
+assert.equal(requests.at(-1).opts.headers,undefined,'/health is public');
+await auth.signOut();
+assert.equal(await auth.currentSession(),null);
+console.log('PASS: mocked native Cognito registration, confirmation, sign-in, password recovery, ID JWT, API, messaging, private S3 POST, health and logout.');

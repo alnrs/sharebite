@@ -1,0 +1,1315 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  ShareBite 604AZ laboratory-aware serverless stack. Creates a JWT-protected
+  API, Lambda backend, four DynamoDB tables, private photo storage, Cognito,
+  monitoring, optional EventBridge, Secrets Manager, Amplify, secure CloudFront,
+  WAF, dashboard and AWS Backup extensions. Not a production certification.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Project and existing lab role}
+        Parameters: [ProjectName, ExistingLambdaRoleName, UseDedicatedRole]
+      - Label: {default: Frontend and authentication}
+        Parameters: [FrontendOrigin, CreateAmplifyScaffold]
+      - Label: {default: Data protection and notifications}
+        Parameters: [EnablePITR, EnableNotifications, EnableEventBridgeExpiry,
+                     EnableMessageIntegritySecret, EnableDashboard]
+      - Label: {default: Optional premium hosting and backup}
+        Parameters: [EnableSecureStaticHosting, EnableEdgeWAF,
+                     EnableAWSBackup, ExistingBackupRoleName]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: sharebite604
+    AllowedPattern: '^[a-z][a-z0-9-]{2,20}$'
+    ConstraintDescription: Use 3-21 lowercase letters, numbers or hyphens.
+    Description: >-
+      Unique prefix within your account and region. Use a new prefix for the new lab.
+  ExistingLambdaRoleName:
+    Type: String
+    Default: LabRole
+    MinLength: 1
+    Description: >-
+      Name of an EXISTING Lambda role in this lab. If uncertain, look in IAM.
+      Do not paste the previous lab's account-specific ARN.
+  UseDedicatedRole:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Set true only if this lab permits IAM role creation; otherwise reuse its LabRole.
+  FrontendOrigin:
+    Type: String
+    Default: http://localhost:5500
+    AllowedPattern: '^https?://[^/]+$'
+    Description: >-
+      Exactly ONE frontend origin (no trailing slash), used for API and photo
+      upload CORS. Update this stack when your NEW Amplify domain is available.
+  CreateAmplifyScaffold:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Optional empty Amplify app/branch, NOT a published website. Enable only
+      after confirming Amplify permissions. New repo connection/manual upload
+      is an additional step and requires your explicit GitHub authorization.
+  EnablePITR:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      DynamoDB point-in-time recovery adds cost and may be restricted in a lab.
+  EnableNotifications:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Provision a notification topic and publish generic event notifications.
+      No email is sent until you separately create/confirm a subscription.
+
+  EnableEventBridgeExpiry:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Hourly expiration maintenance. Enable after frontend sends timezone-aware
+      UTC expiryTime (old datetime-local values lack timezone).
+  EnableMessageIntegritySecret:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Secrets Manager generated key for server-side message HMAC. Requires
+      Lambda runtime secretsmanager:GetSecretValue permission.
+  EnableDashboard:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Optional CloudWatch metrics dashboard; check lab quota/costs.
+  EnableSecureStaticHosting:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Optional private S3 + CloudFront static hosting. Upload HTML/CSS/JS
+      yourself after deployment; separate from optional Amplify app.
+  EnableEdgeWAF:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Optional managed-rule WAF for optional CloudFront hosting only.
+      Set true ONLY when deploying in us-east-1 and static hosting is enabled.
+  EnableAWSBackup:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Optional daily DynamoDB backups via AWS Backup. Requires existing backup
+      service IAM role, supported backup features and sufficient lab permissions.
+  ExistingBackupRoleName:
+    Type: String
+    Default: AWSBackupDefaultServiceRole
+    Description: Existing role name for AWS Backup to assume; created externally.
+
+Conditions:
+  NewLambdaRole: !Equals [!Ref UseDedicatedRole, 'true']
+  WithPITR: !Equals [!Ref EnablePITR, 'true']
+  WithNotifications: !Equals [!Ref EnableNotifications, 'true']
+  WithAmplify: !Equals [!Ref CreateAmplifyScaffold, 'true']
+  WithExpiry: !Equals [!Ref EnableEventBridgeExpiry, 'true']
+  WithSecrets: !Equals [!Ref EnableMessageIntegritySecret, 'true']
+  WithDashboard: !Equals [!Ref EnableDashboard, 'true']
+  WithStaticHosting: !Equals [!Ref EnableSecureStaticHosting, 'true']
+  WithEdgeWAF: !And
+    - !Equals [!Ref EnableEdgeWAF, 'true']
+    - !Equals [!Ref EnableSecureStaticHosting, 'true']
+  WithBackup: !Equals [!Ref EnableAWSBackup, 'true']
+
+Resources:
+  ListingsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-listings'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: listingId, AttributeType: S}
+        - {AttributeName: status, AttributeType: S}
+        - {AttributeName: createdAt, AttributeType: S}
+        - {AttributeName: ownerUserId, AttributeType: S}
+        - {AttributeName: expiryEpoch, AttributeType: N}
+      KeySchema:
+        - {AttributeName: listingId, KeyType: HASH}
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - {AttributeName: status, KeyType: HASH}
+            - {AttributeName: createdAt, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: OwnerIndex
+          KeySchema:
+            - {AttributeName: ownerUserId, KeyType: HASH}
+            - {AttributeName: createdAt, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: ExpiryIndex
+          KeySchema:
+            - {AttributeName: status, KeyType: HASH}
+            - {AttributeName: expiryEpoch, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [WithPITR, true, false]
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: Module, Value: 604AZ}
+
+  ConversationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-conversations'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: userId, AttributeType: S}
+        - {AttributeName: threadId, AttributeType: S}
+      KeySchema:
+        - {AttributeName: userId, KeyType: HASH}
+        - {AttributeName: threadId, KeyType: RANGE}
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [WithPITR, true, false]
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: Module, Value: 604AZ}
+
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-messages'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: threadId, AttributeType: S}
+        - {AttributeName: messageId, AttributeType: S}
+      KeySchema:
+        - {AttributeName: threadId, KeyType: HASH}
+        - {AttributeName: messageId, KeyType: RANGE}
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [WithPITR, true, false]
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: Module, Value: 604AZ}
+
+  RatingsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-ratings'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: listingId, AttributeType: S}
+        - {AttributeName: reviewerUserId, AttributeType: S}
+      KeySchema:
+        - {AttributeName: listingId, KeyType: HASH}
+        - {AttributeName: reviewerUserId, KeyType: RANGE}
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [WithPITR, true, false]
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: Module, Value: 604AZ}
+
+  PrivatePhotoBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration: {Status: Enabled}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref FrontendOrigin]
+            AllowedMethods: [GET, POST, HEAD]
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag]
+            MaxAge: 300
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+          - Id: ExpireNoncurrentPhotoVersions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: DataClassification, Value: PrivatePhotos}
+
+  ShareBiteUserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: 'OFF'
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - {Name: verified_email, Priority: 1}
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      UserPoolTags: {Project: ShareBite, Module: 604AZ}
+
+  WebUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-web'
+      UserPoolId: !Ref ShareBiteUserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 7
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  DonationTopic:
+    Type: AWS::SNS::Topic
+    Condition: WithNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications'
+      DisplayName: ShareBite Events
+      # Generic, non-personal messages only. Add a customer-managed KMS key
+      # in an unrestricted production account after validating key permissions.
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: Module, Value: 604AZ}
+
+  ServerMessageIntegritySecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: WithSecrets
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub '${ProjectName}/message-integrity'
+      Description: >-
+        Random key for optional server-side message integrity signatures.
+        Never expose this secret or its value in browser configuration.
+      GenerateSecretString:
+        SecretStringTemplate: '{"purpose":"message-integrity","version":1}'
+        GenerateStringKey: key
+        PasswordLength: 48
+        ExcludePunctuation: true
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: Component, Value: Messages}
+
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-api'
+      RetentionInDays: 14
+
+  ExpiryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: WithExpiry
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-expiry'
+      RetentionInDays: 14
+
+  GatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-http'
+      RetentionInDays: 14
+
+  DedicatedExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: NewLambdaRole
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: [lambda.amazonaws.com]}
+            Action: [sts:AssumeRole]
+      Policies:
+        - PolicyName: ShareBiteRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListingsAndIndexes
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem,
+                         dynamodb:Query, dynamodb:TransactWriteItems]
+                Resource:
+                  - !GetAtt ListingsTable.Arn
+                  - !Sub '${ListingsTable.Arn}/index/*'
+                  - !GetAtt ConversationsTable.Arn
+                  - !GetAtt MessagesTable.Arn
+                  - !GetAtt RatingsTable.Arn
+              - Sid: PrivateImages
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${PrivatePhotoBucket.Arn}/users/*'
+              - !If
+                - WithNotifications
+                - Sid: GenericNotifications
+                  Effect: Allow
+                  Action: [sns:Publish]
+                  Resource: !Ref DonationTopic
+                - !Ref AWS::NoValue
+              - !If
+                - WithSecrets
+                - Sid: ServerSideMessageSigning
+                  Effect: Allow
+                  Action: [secretsmanager:GetSecretValue]
+                  Resource: !Ref ServerMessageIntegritySecret
+                - !Ref AWS::NoValue
+              - Sid: FunctionLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-api:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-expiry:*'
+
+  ShareBiteFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FunctionLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api'
+      Description: ShareBite authenticated multi-feature prototype API.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !If
+        - NewLambdaRole
+        - !GetAtt DedicatedExecutionRole.Arn
+        - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ExistingLambdaRoleName}'
+      MemorySize: 256
+      Timeout: 20
+      Architectures: [x86_64]
+      Environment:
+        Variables:
+          LISTINGS_TABLE: !Ref ListingsTable
+          CONVERSATIONS_TABLE: !Ref ConversationsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          RATINGS_TABLE: !Ref RatingsTable
+          PHOTO_BUCKET: !Ref PrivatePhotoBucket
+          SNS_TOPIC: !If [WithNotifications, !Ref DonationTopic, '']
+          MESSAGE_SECRET_ARN: !If [WithSecrets, !Ref ServerMessageIntegritySecret, '']
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: Module, Value: 604AZ}
+      Code:
+        ZipFile: |
+          """ShareBite demo API. Source of the CloudFormation inline Lambda code."""
+          import base64
+          import hashlib
+          import hmac
+          import json
+          import os
+          import re
+          import uuid
+          from datetime import datetime, timezone
+
+          import boto3
+          from boto3.dynamodb.conditions import Key
+          from botocore.exceptions import ClientError
+          from boto3.dynamodb.types import TypeSerializer
+
+          DDB = boto3.resource('dynamodb')
+          CLIENT = boto3.client('dynamodb')
+          S3 = boto3.client('s3')
+          SNS = boto3.client('sns')
+          LISTINGS = DDB.Table(os.environ['LISTINGS_TABLE'])
+          CONVERSATIONS = DDB.Table(os.environ['CONVERSATIONS_TABLE'])
+          MESSAGES = DDB.Table(os.environ['MESSAGES_TABLE'])
+          RATINGS = DDB.Table(os.environ['RATINGS_TABLE'])
+          PHOTO_BUCKET = os.environ['PHOTO_BUCKET']
+          SNS_TOPIC = os.environ.get('SNS_TOPIC', '')
+          MESSAGE_SECRET_ARN = os.environ.get('MESSAGE_SECRET_ARN', '')
+          _MESSAGE_SIGNING_KEY = None
+
+
+          def message_signing_key():
+              global _MESSAGE_SIGNING_KEY
+              if not MESSAGE_SECRET_ARN:
+                  return None
+              if _MESSAGE_SIGNING_KEY is None:
+                  secret = boto3.client('secretsmanager').get_secret_value(
+                      SecretId=MESSAGE_SECRET_ARN)['SecretString']
+                  _MESSAGE_SIGNING_KEY = json.loads(secret)['key'].encode('utf-8')
+              return _MESSAGE_SIGNING_KEY
+          SER = TypeSerializer()
+
+
+          def response(status, data):
+              return {'statusCode': status, 'headers': {'content-type': 'application/json'},
+                      'body': json.dumps(data, default=str)}
+
+
+          def read_body(event):
+              raw = event.get('body') or '{}'
+              if event.get('isBase64Encoded'):
+                  raw = base64.b64decode(raw).decode('utf-8')
+              if len(raw) > 16000:
+                  raise ValueError('Request body is too large')
+              value = json.loads(raw)
+              if not isinstance(value, dict):
+                  raise ValueError('JSON body must be an object')
+              return value
+
+
+          def field(data, key, max_len=200, required=True):
+              value = data.get(key, '')
+              if not isinstance(value, str):
+                  raise ValueError(key + ' must be text')
+              value = value.strip()
+              if (required and not value) or len(value) > max_len:
+                  raise ValueError('Invalid or missing ' + key)
+              return value
+
+
+          def claims_for(event):
+              return (event.get('requestContext', {}).get('authorizer', {})
+                      .get('jwt', {}).get('claims', {}))
+
+
+          def photo_link(item):
+              output = dict(item)
+              key = output.get('imageKey')
+              if key:
+                  try:
+                      output['imageUrl'] = S3.generate_presigned_url(
+                          'get_object', Params={'Bucket': PHOTO_BUCKET, 'Key': key},
+                          ExpiresIn=900)
+                  except ClientError:
+                      output['imageUrl'] = None
+              return output
+
+
+          def listing_by_id(listing_id):
+              if not re.fullmatch(r'[a-f0-9-]{36}', listing_id):
+                  return None
+              return LISTINGS.get_item(Key={'listingId': listing_id}).get('Item')
+
+
+          def list_food(query):
+              limit = min(max(int(query.get('limit') or 40), 1), 50)
+              kwargs = {'IndexName': 'StatusIndex',
+                        'KeyConditionExpression': Key('status').eq('Available'),
+                        'ScanIndexForward': False, 'Limit': limit}
+              if query.get('nextToken'):
+                  try:
+                      kwargs['ExclusiveStartKey'] = json.loads(base64.urlsafe_b64decode(
+                          query['nextToken'].encode('ascii')).decode('utf-8'))
+                  except (ValueError, UnicodeDecodeError):
+                      raise ValueError('Invalid nextToken')
+              result = LISTINGS.query(**kwargs)
+              items = [photo_link(i) for i in result.get('Items', [])]
+              if query.get('format') == 'paged':
+                  marker = result.get('LastEvaluatedKey')
+                  token = base64.urlsafe_b64encode(json.dumps(marker).encode()).decode() if marker else None
+                  return {'items': items, 'nextToken': token}
+              return items  # Backward-compatible with current dashboard and browse pages.
+
+
+          def add_food(data, claims):
+              record = {k: field(data, k, n) for k, n in (
+                  ('foodName', 120), ('category', 60), ('description', 2000),
+                  ('quantity', 80), ('location', 160), ('expiryTime', 40),
+                  ('allergyInfo', 1200))}
+              record['storageInstructions'] = field(data, 'storageInstructions', 1000, False)
+              # The owner and public donor name come from VERIFIED claims, not the browser.
+              owner = claims['sub']
+              record['ownerUserId'] = owner
+              record['donorName'] = str(claims.get('name') or 'ShareBite Member')[:120]
+              record['listingId'] = str(uuid.uuid4())
+              record['status'] = 'Available'
+              record['createdAt'] = datetime.now(timezone.utc).isoformat()
+              # Old HTML datetime-local sends no timezone; don't guess. The next frontend
+              # update should send new Date(expiryTime.value).toISOString() with an offset.
+              try:
+                  deadline = datetime.fromisoformat(record['expiryTime'].replace('Z', '+00:00'))
+                  if deadline.tzinfo is not None:
+                      record['expiryEpoch'] = int(deadline.timestamp())
+              except ValueError:
+                  raise ValueError('Invalid expiryTime timestamp')
+              image_key = field(data, 'imageKey', 256, False)
+              if image_key:
+                  if not image_key.startswith('users/' + owner + '/uploads/'):
+                      raise ValueError('Image is not owned by this account')
+                  try:
+                      S3.head_object(Bucket=PHOTO_BUCKET, Key=image_key)
+                  except ClientError:
+                      raise ValueError('Image upload has not completed')
+                  record['imageKey'] = image_key
+              LISTINGS.put_item(Item=record, ConditionExpression='attribute_not_exists(listingId)')
+              notification = 'disabled'
+              if SNS_TOPIC:
+                  try:
+                      SNS.publish(TopicArn=SNS_TOPIC, Subject='New ShareBite listing',
+                                  Message='A new food donation listing has been created.')
+                      notification = 'published'
+                  except ClientError:
+                      notification = 'unavailable'
+              return {'message': 'Food listing added successfully', 'item': photo_link(record),
+                      'notification': notification}
+
+
+          def my_food(owner):
+              result = LISTINGS.query(IndexName='OwnerIndex',
+                                      KeyConditionExpression=Key('ownerUserId').eq(owner),
+                                      ScanIndexForward=False, Limit=50)
+              return [photo_link(i) for i in result.get('Items', [])]
+
+
+          def update_food(listing_id, data, owner):
+              status = field(data, 'status', 16)
+              if status not in ('Available', 'Reserved', 'Collected', 'Removed'):
+                  raise ValueError('Invalid listing status')
+              try:
+                  LISTINGS.update_item(Key={'listingId': listing_id},
+                                       UpdateExpression='SET #st = :s',
+                                       ConditionExpression='ownerUserId = :o',
+                                       ExpressionAttributeNames={'#st': 'status'},
+                                       ExpressionAttributeValues={':s': status, ':o': owner})
+              except CLIENT.exceptions.ConditionalCheckFailedException:
+                  return None
+              return {'message': 'Listing status updated', 'status': status}
+
+
+          def prepare_upload(data, owner):
+              content_type = field(data, 'contentType', 40)
+              extensions = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp'}
+              if content_type not in extensions:
+                  raise ValueError('Only JPG, PNG and WebP photos are allowed')
+              size = data.get('size')
+              if not isinstance(size, int) or not 0 < size <= 5242880:
+                  raise ValueError('Photo must be between 1 byte and 5 MB')
+              key = 'users/' + owner + '/uploads/' + str(uuid.uuid4()) + extensions[content_type]
+              post = S3.generate_presigned_post(
+                  Bucket=PHOTO_BUCKET, Key=key,
+                  Fields={'Content-Type': content_type},
+                  Conditions=[{'Content-Type': content_type}, ['content-length-range', 1, 5242880]],
+                  ExpiresIn=300)
+              return {'uploadUrl': post['url'], 'fields': post['fields'], 'imageKey': key,
+                      'maxBytes': 5242880}
+
+
+          def thread_id(listing_id, user_a, user_b):
+              participants = '|'.join(sorted((user_a, user_b)))
+              return hashlib.sha256((listing_id + '|' + participants).encode()).hexdigest()
+
+
+          def typed(record):
+              return {k: SER.serialize(v) for k, v in record.items()}
+
+
+          def send_message(data, sender):
+              listing_id = field(data, 'listingId', 40)
+              other = field(data, 'toUserId', 100)
+              body = field(data, 'text', 2000)
+              listing = listing_by_id(listing_id)
+              if not listing:
+                  return 404, {'message': 'Listing not found'}
+              if other == sender:
+                  raise ValueError('Cannot message yourself')
+              if listing['ownerUserId'] not in (sender, other):
+                  return 403, {'message': 'Conversation must include the listing owner'}
+              thread = thread_id(listing_id, sender, other)
+              now = datetime.now(timezone.utc).isoformat()
+              message_id = now + '#' + str(uuid.uuid4())
+              msg = {'threadId': thread, 'messageId': message_id,
+                     'senderUserId': sender, 'recipientUserId': other,
+                     'listingId': listing_id, 'text': body, 'sentAt': now}
+              # Optional server-side message-integrity marker, not a substitute for encryption.
+              signing_key = message_signing_key()
+              if signing_key:
+                  canonical = json.dumps(msg, sort_keys=True, separators=(',', ':')).encode()
+                  msg['integrityHmac'] = hmac.new(signing_key, canonical, hashlib.sha256).hexdigest()
+              # One transaction keeps the message and both participants' inboxes in sync.
+              transact = [{'Put': {'TableName': MESSAGES.name, 'Item': typed(msg),
+                                   'ConditionExpression': 'attribute_not_exists(messageId)'}}]
+              for person, peer in ((sender, other), (other, sender)):
+                  transact.append({'Update': {
+                      'TableName': CONVERSATIONS.name,
+                      'Key': typed({'userId': person, 'threadId': thread}),
+                      'UpdateExpression': ('SET peerUserId=:peer, listingId=:listing, '
+                                           'updatedAt=:time, lastMessage=:preview'),
+                      'ExpressionAttributeValues': typed({
+                          ':peer': peer, ':listing': listing_id, ':time': now,
+                          ':preview': body[:100]}),
+                  }})
+              CLIENT.transact_write_items(TransactItems=transact)
+              return 201, {'message': 'Message sent', 'threadId': thread, 'messageId': message_id}
+
+
+          def get_inbox(owner):
+              result = CONVERSATIONS.query(KeyConditionExpression=Key('userId').eq(owner), Limit=50)
+              return sorted(result.get('Items', []), key=lambda x: x['updatedAt'], reverse=True)
+
+
+          def read_thread(query, owner):
+              thread = field(query, 'threadId', 64)
+              membership = CONVERSATIONS.get_item(Key={'userId': owner, 'threadId': thread}).get('Item')
+              if not membership:
+                  return 403, {'message': 'You cannot access this conversation'}
+              result = MESSAGES.query(KeyConditionExpression=Key('threadId').eq(thread),
+                                      ScanIndexForward=False, Limit=50)
+              return 200, list(reversed(result.get('Items', [])))
+
+
+          def write_rating(data, user):
+              listing_id = field(data, 'listingId', 40)
+              score = data.get('score')
+              if type(score) is not int or score < 1 or score > 5:
+                  raise ValueError('Rating must be an integer between 1 and 5')
+              listing = listing_by_id(listing_id)
+              if not listing:
+                  return 404, {'message': 'Listing not found'}
+              if user == listing['ownerUserId']:
+                  return 403, {'message': 'You cannot rate your own listing'}
+              item = {'listingId': listing_id, 'reviewerUserId': user, 'score': score,
+                      'createdAt': datetime.now(timezone.utc).isoformat()}
+              try:
+                  RATINGS.put_item(Item=item, ConditionExpression='attribute_not_exists(reviewerUserId)')
+              except CLIENT.exceptions.ConditionalCheckFailedException:
+                  return 409, {'message': 'You have already rated this listing'}
+              return 201, {'message': 'Rating recorded'}
+
+
+          def get_ratings(listing_id):
+              if not listing_by_id(listing_id):
+                  return 404, {'message': 'Listing not found'}
+              scores = []
+              kwargs = {'KeyConditionExpression': Key('listingId').eq(listing_id)}
+              while True:
+                  result = RATINGS.query(**kwargs)
+                  scores.extend(int(i['score']) for i in result.get('Items', []))
+                  if not result.get('LastEvaluatedKey'):
+                      break
+                  kwargs['ExclusiveStartKey'] = result['LastEvaluatedKey']
+              return 200, {'count': len(scores), 'average': round(sum(scores) / len(scores), 2)
+                           if scores else None}
+
+
+          def lambda_handler(event, context):
+              request_id = getattr(context, 'aws_request_id', 'unknown')
+              method = event.get('requestContext', {}).get('http', {}).get('method', '')
+              path = event.get('rawPath') or '/'
+              query = event.get('queryStringParameters') or {}
+              if method == 'GET' and path == '/health':
+                  return response(200, {'status': 'ok', 'note': 'API process health only'})
+              claims = claims_for(event)
+              if not claims.get('sub'):
+                  return response(401, {'message': 'Verified authentication required'})
+              owner = claims['sub']
+              try:
+                  if method == 'GET' and path == '/food':
+                      return response(200, list_food(query))
+                  if method == 'POST' and path == '/food':
+                      return response(201, add_food(read_body(event), claims))
+                  if method == 'GET' and path == '/my-food':
+                      return response(200, my_food(owner))
+                  if path.startswith('/food/') and method in ('GET', 'PATCH'):
+                      listing_id = path.removeprefix('/food/')
+                      if method == 'GET':
+                          item = listing_by_id(listing_id)
+                          if item and (item.get('status') == 'Available' or item.get('ownerUserId') == owner):
+                              return response(200, photo_link(item))
+                          return response(404, {'message': 'Listing not found'})
+                      if not listing_by_id(listing_id):
+                          return response(404, {'message': 'Listing not found'})
+                      result = update_food(listing_id, read_body(event), owner)
+                      return response(200 if result else 403, result or {'message': 'Not your listing'})
+                  if method == 'POST' and path == '/uploads/presign':
+                      return response(200, prepare_upload(read_body(event), owner))
+                  if method == 'GET' and path == '/conversations':
+                      return response(200, get_inbox(owner))
+                  if method == 'GET' and path == '/messages':
+                      status, result = read_thread(query, owner)
+                      return response(status, result)
+                  if method == 'POST' and path == '/messages':
+                      status, result = send_message(read_body(event), owner)
+                      return response(status, result)
+                  if method == 'GET' and path == '/ratings':
+                      status, result = get_ratings(field(query, 'listingId', 40))
+                      return response(status, result)
+                  if method == 'POST' and path == '/ratings':
+                      status, result = write_rating(read_body(event), owner)
+                      return response(status, result)
+                  if method == 'GET' and path == '/me':
+                      return response(200, {'userId': owner, 'name': claims.get('name', ''),
+                                            'email': claims.get('email', '')})
+                  return response(404, {'message': 'Route not found'})
+              except (ValueError, json.JSONDecodeError) as error:
+                  return response(400, {'message': str(error)})
+              except ClientError as error:
+                  # Do not expose AWS internal errors to the browser.
+                  print(json.dumps({'type': 'aws_error', 'code': error.response.get('Error', {}).get('Code'),
+                                    'requestId': request_id}))
+                  return response(503, {'message': 'Service temporarily unavailable', 'requestId': request_id})
+              except Exception as error:
+                  print(json.dumps({'type': 'unhandled', 'error': str(error), 'requestId': request_id}))
+                  return response(500, {'message': 'Internal service error', 'requestId': request_id})
+
+  ShareBiteHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-http-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: [!Ref FrontendOrigin]
+        AllowMethods: [GET, POST, PATCH, OPTIONS]
+        AllowHeaders: [authorization, content-type]
+        MaxAge: 3600
+      Tags: {Project: ShareBite, Module: 604AZ}
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      Name: ShareBiteCognitoJwt
+      AuthorizerType: JWT
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: [!Ref WebUserPoolClient]
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${ShareBiteUserPool}'
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ShareBiteFunction.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 20000
+
+  PublicHealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'GET /health'
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  BrowseFoodRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'GET /food'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  CreateFoodRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'POST /food'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  MyFoodRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'GET /my-food'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  SingleFoodRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'GET /food/{listingId}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  UpdateFoodRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'PATCH /food/{listingId}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  UploadPresignRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'POST /uploads/presign'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  GetConversationsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'GET /conversations'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  GetMessagesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'GET /messages'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  SendMessageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'POST /messages'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  GetRatingsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'GET /ratings'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  AddRatingRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'POST /ratings'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  OwnProfileRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      RouteKey: 'GET /me'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ShareBiteHttpApi
+      StageName: prod
+      AutoDeploy: true
+      DefaultRouteSettings:
+        DetailedMetricsEnabled: true
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+      AccessLogSettings:
+        DestinationArn: !GetAtt GatewayLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","status":"$context.status",
+          "routeKey":"$context.routeKey","responseLatency":"$context.responseLatency",
+          "integrationError":"$context.integrationErrorMessage"}
+      Tags: {Project: ShareBite, Module: 604AZ}
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ShareBiteFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ShareBiteHttpApi}/*/*'
+
+  FunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      AlarmDescription: One or more Lambda errors in a five-minute period.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref ShareBiteFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [WithNotifications, [!Ref DonationTopic], !Ref AWS::NoValue]
+
+  AmplifyScaffold:
+    Type: AWS::Amplify::App
+    Condition: WithAmplify
+    Properties:
+      Name: !Sub '${ProjectName}-frontend'
+      Platform: WEB
+      Description: >-
+        Empty static frontend scaffold. A manual deployment or an authorized
+        GitHub connection is required before any pages will be accessible.
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: Module, Value: 604AZ}
+
+  AmplifyMainBranch:
+    Type: AWS::Amplify::Branch
+    Condition: WithAmplify
+    Properties:
+      AppId: !GetAtt AmplifyScaffold.AppId
+      BranchName: main
+      EnableAutoBuild: false
+      Stage: DEVELOPMENT
+
+
+  # EventBridge expiry worker only updates timezone-aware listing timestamps.
+  ExpiryCleanupFunction:
+    Type: AWS::Lambda::Function
+    Condition: WithExpiry
+    DependsOn: ExpiryLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-expiry'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !If
+        - NewLambdaRole
+        - !GetAtt DedicatedExecutionRole.Arn
+        - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ExistingLambdaRoleName}'
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          LISTINGS_TABLE: !Ref ListingsTable
+      Code:
+        ZipFile: |
+          """EventBridge optional expiration maintenance for timezone-aware food listings."""
+          import json
+          import os
+          import time
+          from datetime import datetime, timezone
+          import boto3
+          from boto3.dynamodb.conditions import Key
+          from botocore.exceptions import ClientError
+
+          T = boto3.resource('dynamodb').Table(os.environ['LISTINGS_TABLE'])
+
+          def handler(event, context):
+              now = int(time.time())
+              expired = 0
+              checked = 0
+              options = {'IndexName':'ExpiryIndex',
+                         'KeyConditionExpression':Key('status').eq('Available') & Key('expiryEpoch').lte(now),
+                         'Limit':50, 'ProjectionExpression':'listingId, #st, expiryEpoch',
+                         'ExpressionAttributeNames':{'#st':'status'}}
+              while checked < 200:
+                  results = T.query(**options)
+                  for item in results.get('Items', []):
+                      checked += 1
+                      try:
+                          T.update_item(Key={'listingId':item['listingId']},
+                            ConditionExpression='#st = :active AND expiryEpoch <= :now',
+                            UpdateExpression='SET #st = :expired',
+                            ExpressionAttributeNames={'#st':'status'},
+                            ExpressionAttributeValues={':active':'Available', ':expired':'Expired', ':now':now})
+                          expired += 1
+                      except ClientError as exc:
+                          if exc.response.get('Error',{}).get('Code')!='ConditionalCheckFailedException':
+                              raise
+                  marker = results.get('LastEvaluatedKey')
+                  if not marker or checked >= 200:
+                      break
+                  options['ExclusiveStartKey'] = marker
+              print(json.dumps({'event':'expiry_cleanup','checked':checked,'expired':expired,
+                                'utc':datetime.now(timezone.utc).isoformat()}))
+              return {'checked':checked,'expired':expired}
+
+  ExpiryEventRule:
+    Type: AWS::Events::Rule
+    Condition: WithExpiry
+    Properties:
+      Description: Hourly cleanup for expired ShareBite listings (UTC offsets only).
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ExpiryCleanupFunction.Arn
+          Id: ShareBiteExpiryWorker
+
+  ExpiryInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: WithExpiry
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ExpiryCleanupFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ExpiryEventRule.Arn
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-5xx'
+      AlarmDescription: HTTP API reported 5xx errors within five minutes.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - {Name: ApiId, Value: !Ref ShareBiteHttpApi}
+        - {Name: Stage, Value: !Ref ApiStage}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [WithNotifications, [!Ref DonationTopic], !Ref AWS::NoValue]
+
+  ShareBiteDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: WithDashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-operations'
+      DashboardBody: !Sub |
+        {"widgets":[{"type":"metric","x":0,"y":0,"width":12,"height":6,
+        "properties":{"metrics":[["AWS/Lambda","Invocations","FunctionName","${ShareBiteFunction}"],
+        ["AWS/Lambda","Errors","FunctionName","${ShareBiteFunction}"]],
+        "view":"timeSeries","stat":"Sum","period":300,"region":"${AWS::Region}",
+        "title":"ShareBite backend activity and errors"}}]}
+
+  # Alternative to Amplify: a secure, private static-site S3 origin behind CloudFront.
+  # This is empty on deployment; upload your website files yourself.
+  StaticWebsiteBucket:
+    Type: AWS::S3::Bucket
+    Condition: WithStaticHosting
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      VersioningConfiguration: {Status: Enabled}
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: Component, Value: Website}
+
+  StaticOriginAccess:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: WithStaticHosting
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-static-oac'
+        Description: CloudFront signed access to a private ShareBite S3 origin.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  EdgeManagedWAF:
+    Type: AWS::WAFv2::WebACL
+    Condition: WithEdgeWAF
+    Properties:
+      Name: !Sub '${ProjectName}-edge-waf'
+      Scope: CLOUDFRONT
+      DefaultAction: {Allow: {}}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ProjectName}-edge-waf'
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: AWSManagedCommonRuleSet
+          Priority: 0
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-common-rules'
+            SampledRequestsEnabled: true
+
+  StaticCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: WithStaticHosting
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: ShareBite private static site; alternative to Amplify Hosting.
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        WebACLId: !If [WithEdgeWAF, !GetAtt EdgeManagedWAF.Arn, !Ref AWS::NoValue]
+        Origins:
+          - Id: ShareBitePrivateStaticOrigin
+            DomainName: !GetAtt StaticWebsiteBucket.RegionalDomainName
+            S3OriginConfig: {OriginAccessIdentity: ''}
+            OriginAccessControlId: !GetAtt StaticOriginAccess.Id
+        DefaultCacheBehavior:
+          TargetOriginId: ShareBitePrivateStaticOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate: {CloudFrontDefaultCertificate: true}
+      Tags:
+        - {Key: Project, Value: ShareBite}
+        - {Key: Module, Value: 604AZ}
+
+  StaticWebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: WithStaticHosting
+    Properties:
+      Bucket: !Ref StaticWebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSpecificCloudFrontDistributionRead
+            Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: [s3:GetObject]
+            Resource: !Sub '${StaticWebsiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${StaticCloudFrontDistribution}'
+
+  # Optional daily AWS Backup coverage for DynamoDB. Do not enable until the
+  # correct existing AWS Backup service role/feature permissions are verified.
+  ShareBiteBackupVault:
+    Type: AWS::Backup::BackupVault
+    Condition: WithBackup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BackupVaultName: !Sub '${ProjectName}-backup-vault'
+
+  ShareBiteBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Condition: WithBackup
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub '${ProjectName}-daily-dynamodb'
+        BackupPlanRule:
+          - RuleName: DailyAt0300UTC
+            TargetBackupVault: !Ref ShareBiteBackupVault
+            ScheduleExpression: cron(0 3 ? * * *)
+            StartWindowMinutes: 120
+            CompletionWindowMinutes: 360
+            Lifecycle: {DeleteAfterDays: 30}
+
+  ShareBiteBackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Condition: WithBackup
+    Properties:
+      BackupPlanId: !Ref ShareBiteBackupPlan
+      BackupSelection:
+        SelectionName: ShareBiteDynamoDB
+        IamRoleArn: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/service-role/${ExistingBackupRoleName}'
+        Resources:
+          - !GetAtt ListingsTable.Arn
+          - !GetAtt ConversationsTable.Arn
+          - !GetAtt MessagesTable.Arn
+          - !GetAtt RatingsTable.Arn
+
+Outputs:
+  FoodApiUrl:
+    Description: Legacy-compatible URL for old frontend js/config.js apiUrl.
+    Value: !Sub 'https://${ShareBiteHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/food'
+  DynamoDBTableName:
+    Value: !Ref ListingsTable
+  ApiBaseUrl:
+    Description: Copy into SHAREBITE_CONFIG.apiUrl after appending /food.
+    Value: !Sub 'https://${ShareBiteHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  ExistingFrontendCompatibleFoodUrl:
+    Value: !Sub 'https://${ShareBiteHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/food'
+  Region:
+    Value: !Ref AWS::Region
+  CognitoUserPoolId:
+    Value: !Ref ShareBiteUserPool
+  CognitoAppClientId:
+    Value: !Ref WebUserPoolClient
+  CognitoIssuer:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${ShareBiteUserPool}'
+  LambdaFunctionName:
+    Value: !Ref ShareBiteFunction
+  ListingsTableName:
+    Value: !Ref ListingsTable
+  ConversationsTableName:
+    Value: !Ref ConversationsTable
+  MessagesTableName:
+    Value: !Ref MessagesTable
+  RatingsTableName:
+    Value: !Ref RatingsTable
+  PrivatePhotoBucketName:
+    Value: !Ref PrivatePhotoBucket
+  SnsTopicArn:
+    Condition: WithNotifications
+    Value: !Ref DonationTopic
+  ExpiryRuleArn:
+    Condition: WithExpiry
+    Description: Optional hourly expiry task.
+    Value: !GetAtt ExpiryEventRule.Arn
+  IntegritySecretArn:
+    Condition: WithSecrets
+    Description: Secret ARN only; never disclose its value to the browser.
+    Value: !Ref ServerMessageIntegritySecret
+  CloudFrontDomain:
+    Condition: WithStaticHosting
+    Value: !GetAtt StaticCloudFrontDistribution.DomainName
+  StaticWebsiteBucketName:
+    Condition: WithStaticHosting
+    Value: !Ref StaticWebsiteBucket
+  EdgeWAFArn:
+    Condition: WithEdgeWAF
+    Value: !GetAtt EdgeManagedWAF.Arn
+  BackupVaultName:
+    Condition: WithBackup
+    Value: !Ref ShareBiteBackupVault
+  AmplifyAppId:
+    Condition: WithAmplify
+    Value: !GetAtt AmplifyScaffold.AppId
+  AmplifyProvisionalDomain:
+    Condition: WithAmplify
+    Value: !Sub 'https://main.${AmplifyScaffold.DefaultDomain}'

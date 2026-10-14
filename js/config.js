@@ -6,6 +6,6 @@ window.SHAREBITE_CONFIG = Object.freeze({
   mode: 'live',
   region: 'us-east-1',
   apiBaseUrl: 'https://8y6fg62or0.execute-api.us-east-1.amazonaws.com/prod',
-  userPoolId: 'us-east-1_eZwloAqjB',
+  userPoolId: 'us-east-1_eZwIoAqjB',
   userPoolClientId: 'bqjr29947tfaa5sagb0uig0t9'
 });

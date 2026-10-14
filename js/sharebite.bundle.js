@@ -112,8 +112,15 @@ function saveTokens(result, previous = null) {
   if (!result?.IdToken || !result?.AccessToken) throw new Error('Cognito did not return a complete sign-in session.');
   const claims = decodeJwt(result.IdToken);
   const expectedIssuer = `https://cognito-idp.${cfg().region}.amazonaws.com/${cfg().userPoolId}`;
-  if (claims.iss !== expectedIssuer || claims.aud !== cfg().userPoolClientId || claims.token_use !== 'id') {
-    throw new Error('Cognito session belongs to a different pool or app client. Check your stack Outputs.');
+  // These are PUBLIC identity claims, not a token or password. Keep validation strict.
+  if (claims.iss !== expectedIssuer) {
+    throw new Error(`Cognito user-pool mismatch. Your js/config.js expects ${expectedIssuer}, but Cognito issued a token for ${String(claims.iss || 'missing issuer')}. Copy the exact User Pool ID from your CURRENT AWS CloudShell output into js/config.js.`);
+  }
+  if (claims.aud !== cfg().userPoolClientId) {
+    throw new Error(`Cognito app-client mismatch. Your js/config.js expects ${cfg().userPoolClientId}; the returned token identifies ${String(claims.aud || 'missing audience')}. Copy the exact app-client ID from AWS.`);
+  }
+  if (claims.token_use !== 'id') {
+    throw new Error('Cognito returned a token of the wrong type. Sign-in requires an ID token.');
   }
   const tokens = { idToken: result.IdToken, accessToken: result.AccessToken,
     refreshToken: result.RefreshToken || previous?.refreshToken || null };
@@ -138,7 +145,7 @@ async function cognito(action, body) {
   if (!response.ok) {
     const code = String(data.__type || data.code || '').split('#').pop();
     const common = {
-      NotAuthorizedException: 'Incorrect email/password, or your session has expired.',
+      NotAuthorizedException: 'Cognito rejected this sign-in request (incorrect username or password). This is not a token-expiry error. Use the account that succeeded in the AWS CloudShell test.',
       UserNotConfirmedException: 'Confirm your account using the email code before signing in.',
       UsernameExistsException: 'An account with this email already exists.',
       CodeMismatchException: 'That verification code is incorrect. Try again.',

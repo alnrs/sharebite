@@ -1,0 +1,11 @@
+{
+  "name": "sharebite-604az-aws-connected",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Static ShareBite frontend with a Cognito/API Gateway backend; Amplify serves static files only.",
+  "scripts": {
+    "build": "node tools/build_bundle.mjs",
+    "test": "node tests/test_frontend.mjs && node tests/test_live_mock.mjs && node tests/test_bundle_boot.mjs && node tests/test_ui_contract.mjs"
+  }
+}

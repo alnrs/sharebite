@@ -1,0 +1,17 @@
+.DS_Store
+Thumbs.db
+node_modules/
+dist/
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+*credentials*
+*access-key*
+*.zip

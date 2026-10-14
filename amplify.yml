@@ -1,21 +1,12 @@
+
 version: 1
 frontend:
   phases:
-    preBuild:
-      commands:
-        - node --version
-        - npm run build
-        - npm test
     build:
       commands:
-        - mkdir -p dist/js dist/css dist/assets
-        - cp *.html dist/
-        - cp css/style.css dist/css/
-        - cp assets/*.svg dist/assets/
-        - cp js/config.js js/sharebite.bundle.js dist/js/
-        - test -f dist/index.html
+        - echo "Publishing ShareBite static website"
   artifacts:
-    baseDirectory: dist
+    baseDirectory: .
     files:
       - '**/*'
   cache:

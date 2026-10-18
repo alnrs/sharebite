@@ -1,0 +1,524 @@
+
+name: "ShareBite 604AZ | Professional Project Quality Workflow"
+
+run-name: "ShareBite Quality Verification • ${{ github.ref_name }} • ${{ github.event_name }}"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sharebite-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  project-structure:
+    name: "01 | Project Structure Verification"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: "Download ShareBite repository"
+        uses: actions/checkout@v4
+
+      - name: "Verify primary website pages"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for file in \
+            index.html \
+            login.html \
+            dashboard.html \
+            register.html \
+            add-food.html \
+            browse.html \
+            messages.html
+          do
+            test -s "$file"
+            echo "PASS: $file"
+          done
+
+      - name: "Verify frontend directories"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for directory in css js assets
+          do
+            test -d "$directory"
+            echo "PASS: $directory"
+          done
+
+      - name: "Publish project structure report"
+        shell: bash
+        run: |
+          {
+            echo "## ShareBite Project Structure"
+            echo ""
+            echo "- Main website pages verified"
+            echo "- Frontend directories verified"
+            echo "- Repository checkout completed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+  html-quality:
+    name: "02 | HTML Page Quality"
+    runs-on: ubuntu-latest
+    needs: project-structure
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Inspect HTML documents"
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from html.parser import HTMLParser
+
+          class Checker(HTMLParser):
+              pass
+
+          pages = sorted(Path(".").glob("*.html"))
+          assert pages, "No HTML pages found"
+
+          for page in pages:
+              source = page.read_text(encoding="utf-8")
+              assert source.strip(), f"Empty file: {page}"
+              assert "<html" in source.lower(), f"Missing HTML element: {page}"
+
+              parser = Checker(convert_charrefs=True)
+              parser.feed(source)
+              parser.close()
+
+              print(f"PASS: {page}")
+
+          print(f"Checked {len(pages)} HTML pages")
+          PY
+
+      - name: "HTML verification summary"
+        run: |
+          echo "## HTML Verification" >> "$GITHUB_STEP_SUMMARY"
+          echo "HTML files passed basic structural and parser checks." >> "$GITHUB_STEP_SUMMARY"
+
+
+  css-quality:
+    name: "03 | CSS and Responsive Assets"
+    runs-on: ubuntu-latest
+    needs: project-structure
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Verify CSS files"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' files < <(
+            find css -type f -name '*.css' -print0
+          )
+
+          test "${#files[@]}" -gt 0
+
+          for file in "${files[@]}"
+          do
+            test -s "$file"
+            echo "PASS: $file"
+          done
+
+      - name: "CSS verification summary"
+        run: |
+          {
+            echo "## ShareBite CSS"
+            echo ""
+            echo "- CSS stylesheets are present and non-empty"
+            echo "- Premium frontend styling files are available"
+            echo "- Visual rendering still requires browser testing"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+  javascript-quality:
+    name: "04 | JavaScript Syntax Verification"
+    runs-on: ubuntu-latest
+    needs: project-structure
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Set up Node.js"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: "Validate JavaScript syntax"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' files < <(
+            find js tools \
+              -type f \
+              \( -name '*.js' -o -name '*.mjs' \) \
+              -print0 2>/dev/null
+          )
+
+          test "${#files[@]}" -gt 0
+
+          for file in "${files[@]}"
+          do
+            node --check "$file"
+            echo "PASS: $file"
+          done
+
+      - name: "Verify essential scripts"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for file in \
+            js/config.js \
+            js/auth.js \
+            js/sharebite.bundle.js
+          do
+            test -s "$file"
+            echo "PASS: $file"
+          done
+
+      - name: "JavaScript report"
+        run: |
+          {
+            echo "## JavaScript Verification"
+            echo ""
+            echo "- JavaScript syntax checked"
+            echo "- Cognito authentication source present"
+            echo "- Frontend configuration present"
+            echo "- ShareBite browser bundle present"
+            echo ""
+            echo "No live authentication requests were performed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+  python-quality:
+    name: "05 | Lambda Python Syntax"
+    runs-on: ubuntu-latest
+    needs: project-structure
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Validate Python syntax without execution"
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          roots = [
+              Path("infrastructure"),
+              Path("backend"),
+          ]
+
+          files = []
+          for root in roots:
+              if root.exists():
+                  files.extend(root.rglob("*.py"))
+
+          if not files:
+              raise SystemExit("No Python source files found")
+
+          for file in sorted(set(files)):
+              source = file.read_text(encoding="utf-8")
+              ast.parse(source, filename=str(file))
+              print(f"PASS: {file}")
+
+          print(f"Validated {len(set(files))} Python files")
+          PY
+
+      - name: "Python verification report"
+        run: |
+          {
+            echo "## Lambda Python Verification"
+            echo ""
+            echo "- Python source syntax checked"
+            echo "- Source files were not executed"
+            echo "- No AWS Lambda resources were modified"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+  aws-source-quality:
+    name: "06 | AWS Configuration Review"
+    runs-on: ubuntu-latest
+    needs: project-structure
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Verify AWS source directories"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d infrastructure
+          test -s js/config.js
+
+          echo "PASS: Infrastructure directory"
+          echo "PASS: Frontend AWS configuration"
+
+      - name: "Check required Cognito configuration keys"
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          text = Path("js/config.js").read_text(
+              encoding="utf-8"
+          )
+
+          required = [
+              "region",
+              "apiBaseUrl",
+              "userPoolId",
+              "userPoolClientId",
+          ]
+
+          for key in required:
+              if key not in text:
+                  raise SystemExit(
+                      f"Missing configuration key: {key}"
+                  )
+              print(f"PASS: {key}")
+          PY
+
+      - name: "AWS architecture review summary"
+        run: |
+          {
+            echo "## AWS Configuration"
+            echo ""
+            echo "- Infrastructure source folder available"
+            echo "- AWS frontend configuration keys present"
+            echo "- No AWS credentials requested"
+            echo "- No cloud resources deployed or changed"
+            echo ""
+            echo "Live API, Lambda and Cognito integration are not tested here."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+  asset-quality:
+    name: "07 | Image and Asset Availability"
+    runs-on: ubuntu-latest
+    needs: project-structure
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Check asset directory"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d assets
+
+          count=$(find assets -type f | wc -l)
+
+          if [ "$count" -eq 0 ]; then
+            echo "No asset files found"
+            exit 1
+          fi
+
+          echo "PASS: $count asset files available"
+
+      - name: "Asset verification summary"
+        run: |
+          {
+            echo "## Frontend Assets"
+            echo ""
+            echo "- Local asset files are present"
+            echo "- Asset folder included in the repository"
+            echo ""
+            echo "S3 photograph uploads require separate live testing."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+  security-review:
+    name: "08 | Basic Repository Security Checks"
+    runs-on: ubuntu-latest
+    needs: project-structure
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Check for committed private keys"
+        shell: bash
+        run: |
+          python - <<'PY'
+          import subprocess
+
+          result = subprocess.run(
+              ["git", "grep", "-Il", "-e", "-----BEGIN PRIVATE KEY-----",
+               "-e", "-----BEGIN RSA PRIVATE KEY-----",
+               "-e", "-----BEGIN OPENSSH PRIVATE KEY-----",
+               "--", "."],
+              capture_output=True,
+              text=True,
+          )
+
+          if result.returncode == 0:
+              raise SystemExit(
+                  "Possible private key content found in tracked files"
+              )
+
+          if result.returncode != 1:
+              raise SystemExit(
+                  "Unable to complete private-key check"
+              )
+
+          print("PASS: No matching private-key markers found")
+          PY
+
+      - name: "Security summary"
+        run: |
+          {
+            echo "## Basic Security Review"
+            echo ""
+            echo "- Tracked files checked for common private-key markers"
+            echo "- Repository checked without using cloud credentials"
+            echo ""
+            echo "This is not a complete security audit."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+  final-report:
+    name: "09 | ShareBite Project Verification Summary"
+    runs-on: ubuntu-latest
+
+    if: always()
+
+    needs:
+      - project-structure
+      - html-quality
+      - css-quality
+      - javascript-quality
+      - python-quality
+      - aws-source-quality
+      - asset-quality
+      - security-review
+
+    steps:
+      - name: "Generate final verification report"
+        shell: bash
+        env:
+          RESULTS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          results = json.loads(
+              os.environ["RESULTS_JSON"]
+          )
+
+          names = {
+              "project-structure": "Project Structure",
+              "html-quality": "HTML Page Quality",
+              "css-quality": "CSS Assets",
+              "javascript-quality": "JavaScript Syntax",
+              "python-quality": "Python Syntax",
+              "aws-source-quality": "AWS Source Configuration",
+              "asset-quality": "Image and Asset Availability",
+              "security-review": "Basic Security Checks",
+          }
+
+          lines = [
+              "# ShareBite 604AZ - Quality Verification",
+              "",
+              "## Automated Check Results",
+              "",
+              "| Verification | Result |",
+              "|---|---|",
+          ]
+
+          failures = []
+
+          for key, label in names.items():
+              result = results.get(
+                  key, {}
+              ).get("result", "missing")
+
+              if result == "success":
+                  status = "✅ Passed"
+              elif result == "skipped":
+                  status = "⏭️ Skipped"
+                  failures.append(key)
+              else:
+                  status = f"❌ {result}"
+                  failures.append(key)
+
+              lines.append(
+                  f"| {label} | {status} |"
+              )
+
+          lines.extend([
+              "",
+              "## Important Scope",
+              "",
+              "This workflow checks the GitHub repository.",
+              "It does not deploy the production website.",
+              "It does not test live AWS service availability.",
+              "It does not prove messaging or S3 uploads work.",
+              "",
+              "## Verification Status",
+              "",
+          ])
+
+          if not failures:
+              lines.append(
+                  "✅ All configured repository checks passed."
+              )
+          else:
+              lines.append(
+                  "❌ Some checks failed or were skipped."
+              )
+              lines.append(
+                  "Review the individual jobs above."
+              )
+
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"],
+              "a",
+              encoding="utf-8",
+          ) as report:
+              report.write("\n".join(lines) + "\n")
+
+          if failures:
+              raise SystemExit(1)
+
+          print("All ShareBite repository checks passed")
+          PY
